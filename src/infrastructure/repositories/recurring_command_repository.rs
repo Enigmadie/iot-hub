@@ -99,13 +99,13 @@ impl RecurringCommandRepository for PostgresRecurringCommandRepository {
             with local_now as (
                 select
                     timezone($2, now())::date as today,
-                    timezone($2, now())::time as current_time
+                    timezone($2, now())::time as local_clock
             ),
             due as (
                 select id
                 from recurring_device_commands, local_now
                 where enabled
-                    and current_time >= local_time
+                    and local_clock >= local_time
                     and (last_run_on is null or last_run_on < today)
                 order by local_time, id
                 limit $1

@@ -109,14 +109,14 @@ impl RecurringScheduleRepository for PostgresRecurringScheduleRepository {
             with local_now as (
                 select
                     timezone($2, now())::date as today,
-                    timezone($2, now())::time as current_time
+                    timezone($2, now())::time as local_clock
             ),
             due as (
                 select id
                 from recurring_schedules, local_now
                 where enabled
-                    and current_time >= start_time
-                    and (start_time >= end_time or current_time < end_time)
+                    and local_clock >= start_time
+                    and (start_time >= end_time or local_clock < end_time)
                     and (last_started_on is null or last_started_on < today)
                 order by start_time, id
                 limit $1
@@ -152,13 +152,13 @@ impl RecurringScheduleRepository for PostgresRecurringScheduleRepository {
             with local_now as (
                 select
                     timezone($2, now())::date as today,
-                    timezone($2, now())::time as current_time
+                    timezone($2, now())::time as local_clock
             ),
             due as (
                 select id
                 from recurring_schedules, local_now
                 where enabled
-                    and current_time >= end_time
+                    and local_clock >= end_time
                     and (last_ended_on is null or last_ended_on < today)
                     and (
                         (start_time < end_time and last_started_on = today)

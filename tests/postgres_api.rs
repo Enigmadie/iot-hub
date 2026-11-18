@@ -5,20 +5,30 @@ use axum::{
 };
 use event_hub::{
     application::{
-        app_service::DeviceRepository, recurring_command::DeviceCommand,
+        app_service::{DeviceRepository, RecurringCommandRepository, RecurringScheduleRepository},
+        recurring_command::DeviceCommand,
+        recurring_schedule::RecurringScheduleCommand,
         scheduled_command::ScheduledCommand,
     },
     domain::{DeviceId, DeviceName},
     infrastructure::{
-        db::postgres::migrate, integrations::zigbee2mqtt::events::parse,
-        repositories::device_repository::PostgresDeviceRepository,
+        db::postgres::migrate,
+        integrations::zigbee2mqtt::events::parse,
+        repositories::{
+            device_repository::PostgresDeviceRepository,
+            recurring_command_repository::PostgresRecurringCommandRepository,
+            recurring_schedule_repository::PostgresRecurringScheduleRepository,
+        },
     },
     presentation::http::routes::create_router,
 };
 use rumqttc::{Publish, QoS};
 use serde_json::{Value, json};
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
@@ -27,33 +37,7 @@ use tower_http::cors::CorsLayer;
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL pointing to a disposable Postgres database"]
 async fn capabilities_migrations_and_notifications_round_trip_through_postgres() {
-    let url = std::env::var("TEST_DATABASE_URL").expect("set TEST_DATABASE_URL");
-    let admin = sqlx::PgPool::connect(&url).await.unwrap();
-    let schema = format!(
-        "api_test_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    sqlx::query(&format!("create schema {schema}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let search_path = Arc::new(format!("set search_path to {schema}"));
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .after_connect(move |connection, _| {
-            let sql = search_path.clone();
-            Box::pin(async move {
-                sqlx::query(&sql).execute(connection).await?;
-                Ok(())
-            })
-        })
-        .connect(&url)
-        .await
-        .unwrap();
-    migrate(&pool).await.unwrap();
+    let (admin, pool, schema) = isolated_schema().await;
     let repository = PostgresDeviceRepository::new(pool.clone());
     repository
         .upsert(
@@ -179,6 +163,111 @@ async fn capabilities_migrations_and_notifications_round_trip_through_postgres()
         serde_json::to_value(receiver.recv().await.unwrap()).unwrap(),
         json!({"kind":"devices_changed","device_id":"plug"})
     );
+    drop_schema(admin, pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to a disposable Postgres database"]
+async fn recurring_rules_use_app_time_zone_not_session_time_zone() {
+    let (admin, pool, schema) = isolated_schema().await;
+    // Session runs in UTC while the app zone is UTC+12, so a window around the
+    // app-local "now" never contains the UTC wall clock.
+    let time_zone = "Etc/GMT-12".to_string();
+    let local_time = |offset: &'static str| {
+        let pool = pool.clone();
+        let time_zone = time_zone.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(&format!(
+                "select to_char(timezone($1, now()) + interval '{offset}', 'HH24:MI:SS')"
+            ))
+            .bind(time_zone)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let schedules = PostgresRecurringScheduleRepository::new(pool.clone(), time_zone.clone());
+    schedules
+        .create(
+            DeviceId::new("plug".into()),
+            local_time("-1 minute").await,
+            local_time("1 hour").await,
+        )
+        .await
+        .unwrap();
+    let due = schedules.claim_due(10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].command, RecurringScheduleCommand::TurnOn);
+
+    let commands = PostgresRecurringCommandRepository::new(pool.clone(), time_zone.clone());
+    commands
+        .create(
+            DeviceId::new("plug".into()),
+            DeviceCommand::TurnOn,
+            json!({}),
+            local_time("-1 minute").await,
+        )
+        .await
+        .unwrap();
+    commands
+        .create(
+            DeviceId::new("plug".into()),
+            DeviceCommand::TurnOff,
+            json!({}),
+            local_time("1 hour").await,
+        )
+        .await
+        .unwrap();
+    let due = commands.claim_due(10).await.unwrap();
+    let due_commands: Vec<_> = due.iter().map(|job| job.command).collect();
+    // The +1h command wraps past midnight near the end of the local day and is
+    // then legitimately due; otherwise only the -1min command is.
+    assert!(due_commands.contains(&DeviceCommand::TurnOn));
+    if local_time("1 hour").await > local_time("0").await {
+        assert_eq!(due_commands, vec![DeviceCommand::TurnOn]);
+    }
+
+    drop_schema(admin, pool, schema).await;
+}
+
+async fn isolated_schema() -> (sqlx::PgPool, sqlx::PgPool, String) {
+    let url = std::env::var("TEST_DATABASE_URL").expect("set TEST_DATABASE_URL");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+    let schema = format!(
+        "api_test_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    sqlx::query(&format!("create schema {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let search_path = Arc::new(format!("set search_path to {schema}"));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(move |connection, _| {
+            let sql = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(&sql).execute(&mut *connection).await?;
+                sqlx::query("set timezone to 'UTC'")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .unwrap();
+    migrate(&pool).await.unwrap();
+    (admin, pool, schema)
+}
+
+async fn drop_schema(admin: sqlx::PgPool, pool: sqlx::PgPool, schema: String) {
     pool.close().await;
     sqlx::query(&format!("drop schema {schema} cascade"))
         .execute(&admin)
